@@ -131,12 +131,25 @@ class checkpoint():
     def begin_background(self):
         self.queue = Queue()
 
+
+        # def bg_target(queue):
+        #     while True:
+        #         if not queue.empty():
+        #             filename, tensor = queue.get()
+        #             if filename is None: break
+        #             imageio.imwrite(filename, tensor.numpy())
+        
         def bg_target(queue):
             while True:
                 if not queue.empty():
                     filename, tensor = queue.get()
-                    if filename is None: break
-                    imageio.imwrite(filename, tensor.numpy())
+                    if filename is None:
+                        break
+                    img = tensor.numpy()
+                    # Squeeze single channel dimension if present
+                    if img.ndim == 3 and img.shape[2] == 1:
+                        img = img.squeeze(axis=2)
+                    imageio.imwrite(filename, img)
         
         self.process = [
             Process(target=bg_target, args=(self.queue,)) \
