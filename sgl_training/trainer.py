@@ -1,3 +1,13 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+# @Time          : 2025/10/19 18:49
+# @Author        : jcfszxc
+# @Email         : jcfszxc.ai@gmail.com
+# @File          : trainer1.py
+# @Description   : 
+
+
+
 import os
 import math
 from decimal import Decimal
@@ -9,12 +19,26 @@ import torch
 import torch.nn.utils as utils
 import torch.nn as nn
 import torch.nn.functional as F
-from  loss.bceloss import dice_bce_loss as DICE
-from  loss.bceloss import penalty_bce_loss as PBCE
+from loss.bceloss import dice_bce_loss as DICE
+from loss.bceloss import penalty_bce_loss as PBCE
 from loss.tv import TVLoss
+
+# 新增：导入边缘感知多尺度损失
+from loss.edge_aware_loss import MultiScaleLoss, AdaptiveMultiScaleLoss
+
+# ========== 新增：导入血管分割专用损失 ==========
+from loss.vessel_loss import (
+    VesselSegmentationLoss, 
+    FocalTverskyLoss,
+    BoundaryLoss,
+    CombinedVesselLoss
+)
+# ===============================================
+
 from tqdm import tqdm
 import time
 torch.autograd.set_detect_anomaly(True)
+
 class Trainer():
     def __init__(self, args, loader, my_model, my_loss, ckp):
         self.args = args
@@ -30,6 +54,48 @@ class Trainer():
         self.dice_bce_loss = DICE().cuda()
         self.pbce_loss = PBCE().cuda()
         self.tv_loss = TVLoss().cuda()
+        
+        # ========== 配置损失函数选项 ==========
+        # 选择使用哪种损失函数：
+        # 'original': 原始损失
+        # 'multiscale': 多尺度边缘感知损失
+        # 'vessel': 血管分割专用损失
+        # 'combined': 组合血管损失（包含多种损失）
+        self.loss_mode = 'vessel'  # 修改这里选择损失函数
+        
+        # 多尺度边缘感知损失
+        if self.loss_mode == 'multiscale':
+            self.multiscale_loss = MultiScaleLoss(
+                bce_weight=1.0,
+                dice_weight=1.0,
+                edge_weight=2.0,
+                focal_weight=1.0,
+                thin_weight=1.5,
+                edge_enhance=5.0,
+                thin_enhance=3.0
+            ).cuda()
+            
+        # ========== 血管分割专用损失 ==========
+        elif self.loss_mode == 'vessel':
+            self.vessel_loss = VesselSegmentationLoss(
+                dice_weight=0.3,
+                tversky_weight=0.3,      # Tversky损失权重（控制假阳性/假阴性）
+                connectivity_weight=0.2,  # 连续性损失权重
+                bce_weight=0.2,
+                alpha=0.7,               # Tversky α参数（假阴性惩罚）
+                beta=0.3,                # Tversky β参数（假阳性惩罚）
+                thin_vessel_boost=2.0    # 细血管区域增强系数
+            ).cuda()
+            
+        # ========== 组合血管损失 ==========
+        elif self.loss_mode == 'combined':
+            self.combined_loss = CombinedVesselLoss(
+                vessel_weight=0.6,           # 主损失权重
+                focal_tversky_weight=0.2,    # Focal Tversky权重
+                boundary_weight=0.2          # 边界损失权重
+            ).cuda()
+        # =====================================
+        
         self.optimizer = utility.make_optimizer(args, self.model)
 
         if self.args.load != '':
@@ -45,18 +111,72 @@ class Trainer():
         self.ckp.write_log(
             '[Epoch {}]\tLearning rate: {:.2e}'.format(epoch, Decimal(lr))
         )
+        
+        # 如果使用自适应损失，更新epoch
+        if self.loss_mode == 'multiscale' and hasattr(self.multiscale_loss, 'set_epoch'):
+            self.multiscale_loss.set_epoch(epoch)
+        
         self.loss.start_log()
         self.model.train()
 
         timer_data, timer_model = utility.timer(), utility.timer()
+        
+        # 用于记录各个损失分量
+        loss_components = {
+            'total': 0, 'bce': 0, 'dice': 0, 
+            'tversky': 0, 'connectivity': 0,
+            'edge': 0, 'focal': 0, 'thin': 0,
+            'focal_tversky': 0, 'boundary': 0
+        }
+        
         for batch, (data_pack, _) in enumerate(self.loader_train):
             data_pack = self.prepare(data_pack)
             timer_data.hold()
             timer_model.tic()
             hr, ve, ma, te, pm, _, _ = data_pack
             self.optimizer.zero_grad()
-            enh, estimation= self.model(hr, 1)
-            loss = self.loss(estimation, ve, pm*ma) + self.loss(estimation, te, pm*ma)
+            enh, estimation = self.model(hr, 1)
+            
+            # ========== 根据选择的损失模式计算损失 ==========
+            if self.loss_mode == 'original':
+                # 使用原始损失函数
+                loss = self.loss(estimation, ve, pm*ma) + self.loss(estimation, te, pm*ma)
+                
+            elif self.loss_mode == 'multiscale':
+                # 使用多尺度边缘感知损失
+                loss1, loss_dict1 = self.multiscale_loss(estimation, ve, pm * ma)
+                loss2, loss_dict2 = self.multiscale_loss(estimation, te, pm * ma)
+                loss = loss1 + loss2
+                
+                # 记录损失分量
+                for key in ['bce', 'dice', 'edge', 'focal', 'thin']:
+                    if key in loss_dict1:
+                        loss_components[key] += (loss_dict1[key].item() + loss_dict2[key].item())
+                loss_components['total'] += loss.item()
+                
+            elif self.loss_mode == 'vessel':
+                # 使用血管分割专用损失
+                loss1, loss_dict1 = self.vessel_loss(estimation, ve, pm * ma)
+                loss2, loss_dict2 = self.vessel_loss(estimation, te, pm * ma)
+                loss = loss1 + loss2
+                
+                # 记录损失分量
+                for key in loss_dict1.keys():
+                    if key in loss_components:
+                        loss_components[key] += (loss_dict1[key].item() + loss_dict2[key].item())
+                        
+            elif self.loss_mode == 'combined':
+                # 使用组合血管损失
+                loss1, loss_dict1 = self.combined_loss(estimation, ve, pm * ma)
+                loss2, loss_dict2 = self.combined_loss(estimation, te, pm * ma)
+                loss = loss1 + loss2
+                
+                # 记录损失分量
+                for key in loss_dict1.keys():
+                    if key in loss_components:
+                        loss_components[key] += (loss_dict1[key].item() + loss_dict2[key].item())
+            # =============================================
+            
             loss.backward()
             if self.args.gclip > 0:
                 utils.clip_grad_value_(
@@ -68,12 +188,44 @@ class Trainer():
             timer_model.hold()
 
             if (batch + 1) % self.args.print_every == 0:
+                # ========== 显示详细损失信息 ==========
+                if self.loss_mode != 'original' and batch > 0:
+                    # 计算平均损失
+                    avg_losses = {k: v / (batch + 1) for k, v in loss_components.items() if v > 0}
+                    
+                    # 根据损失模式显示不同的信息
+                    if self.loss_mode == 'vessel':
+                        loss_info = '[Total: {:.4f} | Dice: {:.4f} | Tversky: {:.4f} | Conn: {:.4f} | BCE: {:.4f}]'.format(
+                            avg_losses.get('total', 0), 
+                            avg_losses.get('dice', 0),
+                            avg_losses.get('tversky', 0),
+                            avg_losses.get('connectivity', 0),
+                            avg_losses.get('bce', 0)
+                        )
+                    elif self.loss_mode == 'combined':
+                        loss_info = '[Total: {:.4f} | Vessel: {:.4f} | F-Tversky: {:.4f} | Boundary: {:.4f}]'.format(
+                            avg_losses.get('total', 0),
+                            avg_losses.get('dice', 0) + avg_losses.get('tversky', 0),
+                            avg_losses.get('focal_tversky', 0),
+                            avg_losses.get('boundary', 0)
+                        )
+                    else:  # multiscale
+                        loss_info = '[Total: {:.4f} | BCE: {:.4f} | Dice: {:.4f} | Edge: {:.4f}]'.format(
+                            avg_losses.get('total', 0),
+                            avg_losses.get('bce', 0),
+                            avg_losses.get('dice', 0),
+                            avg_losses.get('edge', 0)
+                        )
+                else:
+                    loss_info = self.loss.display_loss(batch)
+                
                 self.ckp.write_log('[{}/{}]\t{}\t{:.1f}+{:.1f}s'.format(
                     (batch + 1) * self.args.batch_size,
                     len(self.loader_train.dataset),
-                    self.loss.display_loss(batch),
+                    loss_info,
                     timer_model.release(),
                     timer_data.release()))
+                # ==========================================
 
             timer_data.tic()
 
@@ -159,7 +311,6 @@ class Trainer():
                     SE.append(Se)
                     SP.append(Sp)
 
-
                 print(np.mean(np.stack(BIOU)))
                 print('Acc: %s  |  Se: %s |  Sp: %s |  Auc: %s |  Background_IOU: %s |  vessel_IOU: %s '%(str(np.mean(np.stack(ACC))),str(np.mean(np.stack(SE))), str(np.mean(np.stack(SP))),str(np.mean(np.stack(AUC))),str(np.mean(np.stack(Background_IOU))),str(np.mean(np.stack(Vessel_IOU)))))
                 self.ckp.log[-1, idx_data, idx_scale] /= len(d)
@@ -200,7 +351,6 @@ class Trainer():
     def terminate(self):
         if self.args.test_only:
             self.test()
-            #self.evaluation_model()
             return True
         else:
             epoch = self.optimizer.get_last_epoch() + 1

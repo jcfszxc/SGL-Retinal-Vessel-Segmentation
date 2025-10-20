@@ -1,0 +1,12 @@
+============================================================
+评估结果
+============================================================
+DICE:         nan
+Accuracy:     nan
+Sensitivity:  nan
+Specificity:  nan
+AUC:          nan
+Background IoU: nan
+Vessel IoU:   nan
+Boundary IoU: nan
+============================================================
